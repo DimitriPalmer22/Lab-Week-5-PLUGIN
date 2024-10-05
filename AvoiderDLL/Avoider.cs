@@ -1,33 +1,38 @@
 ﻿using UnityEngine;
 using UnityEngine.AI;
+using UnityEngine.Serialization;
 
 namespace AvoiderDLL;
 
+[RequireComponent(typeof(NavMeshAgent))]
 public class Avoider : MonoBehaviour
 {
     private NavMeshAgent _navMeshAgent;
 
-    [Tooltip("Put the player here!")] [SerializeField]
-    private GameObject objectToAvoid;
+    [SerializeField] private GameObject objectToAvoid;
 
-    [SerializeField] private bool drawGizmos;
+    [SerializeField] private bool drawGizmos = true;
 
-    [Header("Stats")] [SerializeField] [Min(0)]
-    private float range;
-
-    [SerializeField] [Min(0)] private float speed;
+    [Header("Stats")] [SerializeField] [Min(.5f)]
+    private float detectionRange = 7.5f;
 
     private bool _objectInRange;
 
+    [SerializeField] [Min(.5f)] private float speed = 10;
+
+
     private PoissonDiscSampler _sampler;
 
-    [SerializeField] private float sizeX;
-    [SerializeField] private float sizeY;
-    [SerializeField] private float cellSize;
+    [Header("Poisson Disc Path Sampling Settings")] [SerializeField] [Min(2)]
+    private float areaSize = 32;
+
+    [SerializeField] [Min(.5f)] private float density = 2;
 
     private Vector3? _targetPosition;
     private HashSet<Vector3> _allSpots;
     private IReadOnlyCollection<Vector3> _validSpots;
+
+    private int _actorLayerMask;
 
     private void Awake()
     {
@@ -36,19 +41,44 @@ public class Avoider : MonoBehaviour
             Debug.LogWarning($"{gameObject.name} NEEDS A NAV MESH AGENT TO WORK! Also, make sure to bake a nav mesh!");
     }
 
+    private void Start()
+    {
+        // Create a layer mask that only ignores the actor layer
+        _actorLayerMask = ~LayerMask.GetMask("Actor");
+    }
+
     private void Update()
     {
         // Maintain eye contact with the player
         MaintainEyeContact();
 
         // Can the object see this game object?
-        var canSeeMe = IsPositionVisible(transform.position);
+        var canSeeMe = IsObjectVisible(gameObject);
 
         // Once the object is in range, create poisson disc points
         var currentDistance = Vector3.Distance(transform.position, objectToAvoid.transform.position);
 
+        // If the target position is not null and
+        // If the object to avoid can see the target position,
+        if (_targetPosition != null && IsPositionVisible(_targetPosition.Value, _actorLayerMask))
+        {
+            // clear the target position
+            _targetPosition = null;
+
+            // Also reset the object in range flag
+            _objectInRange = false;
+
+            // Clear the valid spots
+            _validSpots = new HashSet<Vector3>();
+
+            // Clear the all spots
+            _allSpots = new HashSet<Vector3>();
+
+            // This forces the object to avoid to reevaluate its position
+        }
+
         // JUST entered / exited the range
-        if (currentDistance < range && !_objectInRange)
+        if (canSeeMe && currentDistance < detectionRange && !_objectInRange)
         {
             _objectInRange = true;
 
@@ -75,7 +105,7 @@ public class Avoider : MonoBehaviour
             if (_targetPosition != null)
                 _navMeshAgent.SetDestination(_targetPosition.Value);
         }
-        else if (currentDistance > range && _objectInRange)
+        else if (currentDistance > detectionRange && _objectInRange)
         {
             _objectInRange = false;
         }
@@ -90,7 +120,7 @@ public class Avoider : MonoBehaviour
             _navMeshAgent.speed = speed;
 
         // If this game object is close to its target position, clear the target position
-        if (_targetPosition != null && Vector3.Distance(transform.position, _targetPosition.Value) < 0.5f)
+        if (_targetPosition != null && Vector3.Distance(transform.position, _targetPosition.Value) < 1f)
             _targetPosition = null;
     }
 
@@ -100,7 +130,7 @@ public class Avoider : MonoBehaviour
         transform.LookAt(objectToAvoid.transform);
     }
 
-    private bool IsPositionVisible(Vector3 position)
+    private bool IsPositionVisible(Vector3 position, int layerMask = ~0)
     {
         // Return false if there is no object to avoid
         if (objectToAvoid == null)
@@ -108,25 +138,50 @@ public class Avoider : MonoBehaviour
 
         // Do a ray cast from the object to avoid to this player
         if (Physics.Raycast(
-                objectToAvoid.transform.position,
-                position - objectToAvoid.transform.position,
-                out var hitInfo
+                origin: objectToAvoid.transform.position,
+                direction: position - objectToAvoid.transform.position,
+                hitInfo: out var hitInfo,
+                maxDistance: 9999,
+                layerMask: layerMask
             )
            )
         {
-            // If the object to avoid can see this player, return true
-            if (hitInfo.collider.gameObject == gameObject)
+            // If the cast hit anything, return false
+            return false;
+        }
+
+        // If the cast didn't hit anything, return true
+        return true;
+    }
+
+    private bool IsObjectVisible(GameObject obj, int layerMask = ~0)
+    {
+        // Return false if there is no object to avoid
+        if (objectToAvoid == null)
+            return false;
+
+        // Do a ray cast from the object to avoid to this player
+        if (Physics.Raycast(
+                origin: objectToAvoid.transform.position,
+                direction: obj.transform.position - objectToAvoid.transform.position,
+                hitInfo: out var hitInfo,
+                maxDistance: 9999,
+                layerMask: layerMask
+            )
+           )
+        {
+            // If the cast hit the object we are looking for, return true
+            if (hitInfo.collider.gameObject == obj)
                 return true;
         }
 
-        // If the object to avoid can't see this player, return false
         return false;
     }
 
     private HashSet<Vector3> FindASpot()
     {
         // Create a poisson disc sampler
-        _sampler = new PoissonDiscSampler(sizeX, sizeY, cellSize);
+        _sampler = new PoissonDiscSampler(areaSize, areaSize, density);
 
         // Get the samples
         var samples = _sampler.Samples();
@@ -138,7 +193,10 @@ public class Avoider : MonoBehaviour
         foreach (var sample in samples)
         {
             // convert the sampled position to a vector3
-            var sample3 = new Vector3(sample.x, transform.position.y, sample.y);
+            // and add the current position of the game object to make it dynamic
+            var sample3 = transform.position +
+                          new Vector3(sample.x, 0, sample.y) -
+                          new Vector3(areaSize / 2, 0, areaSize / 2);
 
             // Add the sample to the list of all spots
             _allSpots.Add(sample3);
@@ -148,16 +206,14 @@ public class Avoider : MonoBehaviour
                 continue;
 
             // Set the sample3 to the hit position
-            sample3 = hit.position;
+            sample3 = hit.position + new Vector3(0, _navMeshAgent.height, 0);
 
             // If the enemy can see the spot, skip it
-            if (IsPositionVisible(sample3))
+            if (IsPositionVisible(sample3, _actorLayerMask))
                 continue;
 
             validSpots.Add(sample3);
         }
-
-        Debug.Log(string.Format("All spots: {0}, Valid spots: {1}", _allSpots.Count, validSpots.Count));
 
         return validSpots;
     }
@@ -170,15 +226,15 @@ public class Avoider : MonoBehaviour
 
         // Draw the range of the avoider
         Gizmos.color = Color.red;
-        Gizmos.DrawWireSphere(transform.position, range);
+        Gizmos.DrawWireSphere(transform.position, detectionRange);
 
-        // Draw each sample point
-        Gizmos.color = Color.green;
-        if (_allSpots != null)
-        {
-            foreach (var spot in _allSpots)
-                Gizmos.DrawSphere(spot, 0.1f);
-        }
+        // // Draw each sample point
+        // Gizmos.color = Color.green;
+        // if (_allSpots != null)
+        // {
+        //     foreach (var spot in _allSpots)
+        //         Gizmos.DrawSphere(spot, 0.1f);
+        // }
 
         // Draw each valid spot
         Gizmos.color = Color.yellow;
